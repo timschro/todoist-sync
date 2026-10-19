@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Two-way sync between an Obsidian TASKS.md file and a Todoist project.
+"""Two-way sync between an Obsidian TASKS.md file and a Todoist project,
+plus checkbox sync with the "## Open tasks" list in daily notes.
 
 Mapping
   file                        -> Todoist project (default "SCAYLE")
@@ -901,6 +902,14 @@ def sync(md_path: Path, project_name: str, state_dir: Path, dry_run: bool) -> in
     return 0
 
 
+def guarded(what: str, fn: Callable, *args) -> None:
+    """Run an optional pass; its failure must never block the TASKS.md <-> Todoist sync."""
+    try:
+        fn(*args)
+    except Exception as e:
+        log(f"WARN {what} skipped: {type(e).__name__}: {e}")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--file", type=Path, default=Path(os.environ.get("TODOIST_SYNC_FILE", DEFAULT_FILE)))
@@ -932,10 +941,10 @@ def main() -> int:
             if not a.no_import:
                 import_new_tasks(a.file, a.scan_dir, a.state_dir, a.dry_run)
             if not a.no_daily:
-                apply_daily_ticks(a.file, a.daily_dir, a.state_dir, a.dry_run)
+                guarded("daily-note ticks", apply_daily_ticks, a.file, a.daily_dir, a.state_dir, a.dry_run)
             rc = sync(a.file, a.project, a.state_dir, a.dry_run)
             if rc == 0 and not a.no_daily:
-                reflect_to_daily(a.file, a.daily_dir, a.state_dir, a.dry_run)
+                guarded("daily-note update", reflect_to_daily, a.file, a.daily_dir, a.state_dir, a.dry_run)
             return rc
         except Exception as e:  # keep launchd log readable
             log(f"ERROR {type(e).__name__}: {e}")
