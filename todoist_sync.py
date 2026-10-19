@@ -584,27 +584,44 @@ def import_new_tasks(md_path: Path, scan_dir: Path, state_dir: Path, dry_run: bo
 
 DAILY_NAME_RE = re.compile(r"^(?P<date>\d{4}-\d{2}-\d{2})(?: Afternoon)?\.md$")
 DAILY_BLOCK = "open tasks"
+SUGGESTED_BLOCK = "suggested new tasks"
+SUGGESTED_KEY = "+"  # prefix for suggested-task entries in the per-note baseline
+SUGGESTED_SPLIT_RE = re.compile(r"\s+[—–]\s+|\s+(?=\()")
 DAILY_WINDOW_DAYS = 7
 
 
-def daily_task_lines(text: str) -> List[Tuple[int, bool, str]]:
-    """(line_no, checked, normalized title) for task lines under '## Open tasks' (up to the next '## ')."""
+def block_task_lines(text: str, block: str) -> List[Tuple[int, bool, str]]:
+    """(line_no, checked, body) for task lines under '## <block>' (up to the next '## ')."""
     out: List[Tuple[int, bool, str]] = []
     inside = False
     for i, line in enumerate(text.split("\n")):
         h = HEADING_RE.match(line)
         if h:  # '## x' only; '### Active' does not match and stays inside the block
-            inside = h["name"].lower() == DAILY_BLOCK
+            inside = h["name"].lower() == block
             continue
-        if not inside:
-            continue
-        m = TASK_RE.match(line)
-        if not m:
-            continue
-        content, _ = parse_body(m["body"])
-        if content:
-            out.append((i, m["check"] in "xX", norm(content).lower()))
+        if inside:
+            m = TASK_RE.match(line)
+            if m and m["body"].strip():
+                out.append((i, m["check"] in "xX", m["body"].strip()))
     return out
+
+
+def daily_task_lines(text: str) -> List[Tuple[int, bool, str]]:
+    """(line_no, checked, normalized title) for task lines under '## Open tasks'."""
+    out = []
+    for i, checked, body in block_task_lines(text, DAILY_BLOCK):
+        content, _ = parse_body(body)
+        if content:
+            out.append((i, checked, norm(content).lower()))
+    return out
+
+
+def parse_suggestion(body: str) -> Tuple[str, str]:
+    """Title/details of a suggested task: '**Title** - x', or 'Title — x' / 'Title (x)'."""
+    if BOLD_RE.match(body):
+        return parse_body(body)
+    parts = SUGGESTED_SPLIT_RE.split(body, maxsplit=1)
+    return parts[0].strip(), (parts[1].strip() if len(parts) > 1 else "")
 
 
 def daily_notes(daily_dir: Path, today: dt.date, window: int = DAILY_WINDOW_DAYS) -> List[Tuple[dt.date, Path]]:
@@ -634,7 +651,8 @@ def title_index(doc: Doc) -> Dict[str, List[LocalTask]]:
 
 def apply_daily_ticks(md_path: Path, daily_dir: Path, state_dir: Path, dry_run: bool,
                       today: Optional[dt.date] = None) -> None:
-    """Daily notes -> TASKS.md: a task newly ticked under '## Open tasks' is marked done in TASKS.md.
+    """Daily notes -> TASKS.md: a task newly ticked under '## Open tasks' is marked done in TASKS.md,
+    a newly ticked '## Suggested new tasks' line is added to '## Active' as an open task.
 
     Only a change since the last seen value of that line counts, so an old tick never re-closes a task
     that was reopened later, and an unticked line never reopens anything.
@@ -649,11 +667,29 @@ def apply_daily_ticks(md_path: Path, daily_dir: Path, state_dir: Path, dry_run: 
     idx = title_index(doc)
 
     decisions: Dict[int, Optional[Decision]] = {}
+    appends: List[Tuple[Optional[str], Task]] = []
+    known = set(idx) | {norm(t.content).lower() for t in base.values()}
     new_seen: Dict[str, Dict[str, bool]] = {}
     for _, p in daily_notes(daily_dir, today):
         prev = seen.get(p.name, {})
         cur = new_seen.setdefault(p.name, {})
-        for _, checked, title in daily_task_lines(p.read_text(encoding="utf-8")):
+        text = p.read_text(encoding="utf-8")
+        for _, checked, body in block_task_lines(text, SUGGESTED_BLOCK):
+            content, desc = parse_suggestion(body)
+            title = norm(content).lower()
+            if not title:
+                continue
+            cur[SUGGESTED_KEY + title] = checked
+            if not checked or prev.get(SUGGESTED_KEY + title) is True:
+                continue
+            if title in known:
+                log(f"daily note '{p.name}': ticked suggestion already in TASKS.md, ignored: '{content}'")
+                continue
+            known.add(title)
+            appends.append((None, Task(content, desc, DEFAULT_SECTION, False)))
+            log(f"{'[dry-run] would add' if dry_run else 'added'} suggested task from daily note '{p.name}': "
+                f"'{content}'")
+        for _, checked, title in daily_task_lines(text):
             cur[title] = checked
             if not checked or prev.get(title) is True:
                 continue
@@ -675,8 +711,8 @@ def apply_daily_ticks(md_path: Path, daily_dir: Path, state_dir: Path, dry_run: 
                 f"'{lt.task.content}'")
     if dry_run:
         return
-    if decisions:
-        new_text = render_doc(doc, decisions, [])
+    if decisions or appends:
+        new_text = render_doc(doc, decisions, appends)
         if md_path.read_text(encoding="utf-8") != text0:
             log("TASKS.md changed while applying daily-note ticks; will retry next run")
             return

@@ -70,11 +70,48 @@ class DailyNoteTests(unittest.TestCase):
         self.ticks()
         self.assertIn("Alpha", self.done_titles())
 
-    def test_suggested_and_needs_attention_ignored(self):
+    def test_needs_attention_ignored(self):
         self.write_note(TODAY, ["- [ ] **Alpha** - first"])
         self.ticks()
         self.assertEqual(self.done_titles(), {"Old"})
+
+    def open_titles(self):
+        doc = ts.parse_doc(self.md.read_text(), {})
+        return {t.task.content: t.task for t in doc.tasks if not t.task.done}
+
+    def test_ticked_suggestion_added_as_open_task(self):
+        self.write_note(TODAY, ["- [ ] **Alpha** - first"])
+        self.ticks()
+        tasks = self.open_titles()
+        self.assertIn("Brand new", tasks)
+        self.assertNotIn("Gamma", self.done_titles())  # same-title suggestion: already known, not added again
+        self.assertEqual(self.md.read_text().count("**Gamma**"), 1)
+        text = self.md.read_text()
+        self.assertLess(text.index("**Brand new**"), text.index("## Done"))
+
+    def test_suggestion_added_once(self):
+        self.write_note(TODAY, ["- [ ] **Alpha** - first"])
+        self.write_note(TODAY - dt.timedelta(days=1), ["- [ ] **Alpha** - first"])
+        self.ticks()
+        self.ticks()
+        self.assertEqual(self.md.read_text().count("**Brand new**"), 1)
+
+    def test_suggestion_not_readded_after_deletion(self):
+        self.write_note(TODAY, ["- [ ] **Alpha** - first"])
+        self.ticks()
+        self.md.write_text(TASKS)  # user deleted it again
+        self.ticks()
         self.assertNotIn("Brand new", self.md.read_text())
+
+    def test_parse_plain_suggestion(self):
+        self.assertEqual(
+            ts.parse_suggestion("Skim the tickets from Friday — AM-1 x, AM-2 y ([AM-1](u)) · [[fielmann]]"),
+            ("Skim the tickets from Friday", "AM-1 x, AM-2 y ([AM-1](u)) · [[fielmann]]"))
+        self.assertEqual(
+            ts.parse_suggestion("Read the \"BF 2026: Prep\" mail sent on Friday ([open](u))"),
+            ("Read the \"BF 2026: Prep\" mail sent on Friday", "([open](u))"))
+        self.assertEqual(ts.parse_suggestion("Complete the training by 23 Oct"),
+                         ("Complete the training by 23 Oct", ""))
 
     def test_stale_tick_does_not_reclose_reopened_task(self):
         self.write_note(TODAY, ["- [x] **Alpha** - first"])
@@ -110,7 +147,7 @@ class DailyNoteTests(unittest.TestCase):
         text = p.read_text()
         self.assertIn("- [x] **Beta** - second", text)
         self.assertIn("- [ ] **Alpha** - first", text)
-        self.assertIn("- [x] **Brand new**", text)  # other sections untouched
+        self.assertIn("- [x] **Brand new**", text)  # suggestions are never toggled
         self.assertTrue(json.loads((self.state / "state.json").read_text())["daily"][p.name]["beta"])
 
     def test_reflect_only_writes_today(self):

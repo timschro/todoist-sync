@@ -85,8 +85,13 @@ after the title does not affect the match. Two passes run alongside the Todoist 
   applied is removed again if the task was reopened. The script only toggles `[ ]`/`[x]` on existing lines; it never
   adds or removes lines.
 
-Ignored: every other section (Needs attention, Emails needing reply, Suggested new tasks …), titles that match no task
-or more than one task, and notes older than 7 days. Options: `--daily-dir` or `TODOIST_SYNC_DAILY_DIR`, `--no-daily`.
+- **Suggested new tasks → TASKS.md:** ticking a line under `## Suggested new tasks` (last 7 days) means "track this":
+  it is added to `## Active` as an open task and pushed to Todoist. The title is the bold text, or else the text before
+  the first ` — ` or ` (`; the rest becomes the description. Suggestions whose title already exists in TASKS.md (or was
+  synced before) are not added again, and the tick is never toggled back.
+
+Ignored: every other section (Needs attention, Emails needing reply …), titles that match no task or more than one task,
+and notes older than 7 days. Options: `--daily-dir` or `TODOIST_SYNC_DAILY_DIR`, `--no-daily`.
 
 ## Tests
 
