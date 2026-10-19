@@ -71,11 +71,28 @@ manual. Those edits are not imported. To change or complete a task, edit it in T
 - The previous version of the file is kept in `~/.local/state/todoist-sync/TASKS.md.bak`.
 - Tasks created in Todoist before an interrupted local write get their ids back on the next run, so no duplicates are created.
 
+## Daily notes
+
+Daily notes (`YYYY-MM-DD.md` and `YYYY-MM-DD Afternoon.md` in the vault root) contain a copy of the open tasks under
+`## Open tasks`. Those lines have no `%%td:` id, so they are matched to TASKS.md by their **bold title**. Text added
+after the title does not affect the match. Two passes run alongside the Todoist sync:
+
+- **Daily note → TASKS.md (before the sync):** if you tick a task in a note from the last 7 days, it is marked done in
+  TASKS.md and closed in Todoist in the same run. Only a change since the last run counts (tracked per note in
+  `state.json` under `daily`). An old tick never re-closes a task you later reopened, and unticking a line never reopens
+  anything; reopen tasks in TASKS.md or Todoist.
+- **TASKS.md → today's note (after the sync):** tasks completed elsewhere are ticked in today's note. A tick you already
+  applied is removed again if the task was reopened. The script only toggles `[ ]`/`[x]` on existing lines; it never
+  adds or removes lines.
+
+Ignored: every other section (Needs attention, Emails needing reply, Suggested new tasks …), titles that match no task
+or more than one task, and notes older than 7 days. Options: `--daily-dir` or `TODOIST_SYNC_DAILY_DIR`, `--no-daily`.
+
 ## Tests
 
 ```sh
-python3 -m unittest -v test_todoist_sync test_e2e_fake
+python3 -m unittest -v test_todoist_sync test_e2e_fake test_daily_notes
 ```
 
-Overrides: `--file`, `--project`, `--state-dir`, or the matching environment variables `TODOIST_SYNC_FILE`,
-`TODOIST_SYNC_PROJECT`, `TODOIST_SYNC_STATE_DIR`. You can also set `TODOIST_API_TOKEN` instead of using the Keychain.
+Overrides: `--file`, `--project`, `--state-dir`, `--daily-dir`, or the matching environment variables `TODOIST_SYNC_FILE`,
+`TODOIST_SYNC_PROJECT`, `TODOIST_SYNC_STATE_DIR`, `TODOIST_SYNC_DAILY_DIR`. You can also set `TODOIST_API_TOKEN` instead of using the Keychain.

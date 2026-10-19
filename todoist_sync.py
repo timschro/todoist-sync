@@ -579,6 +579,161 @@ def import_new_tasks(md_path: Path, scan_dir: Path, state_dir: Path, dry_run: bo
     save_state(state_path, state)
 
 
+# --------------------------------------------------------------------------- daily notes
+
+DAILY_NAME_RE = re.compile(r"^(?P<date>\d{4}-\d{2}-\d{2})(?: Afternoon)?\.md$")
+DAILY_BLOCK = "open tasks"
+DAILY_WINDOW_DAYS = 7
+
+
+def daily_task_lines(text: str) -> List[Tuple[int, bool, str]]:
+    """(line_no, checked, normalized title) for task lines under '## Open tasks' (up to the next '## ')."""
+    out: List[Tuple[int, bool, str]] = []
+    inside = False
+    for i, line in enumerate(text.split("\n")):
+        h = HEADING_RE.match(line)
+        if h:  # '## x' only; '### Active' does not match and stays inside the block
+            inside = h["name"].lower() == DAILY_BLOCK
+            continue
+        if not inside:
+            continue
+        m = TASK_RE.match(line)
+        if not m:
+            continue
+        content, _ = parse_body(m["body"])
+        if content:
+            out.append((i, m["check"] in "xX", norm(content).lower()))
+    return out
+
+
+def daily_notes(daily_dir: Path, today: dt.date, window: int = DAILY_WINDOW_DAYS) -> List[Tuple[dt.date, Path]]:
+    if not daily_dir.is_dir():
+        log(f"WARN daily notes dir not found: {daily_dir}")
+        return []
+    notes = []
+    for p in daily_dir.iterdir():
+        m = DAILY_NAME_RE.match(p.name)
+        if not m:
+            continue
+        try:
+            d = dt.date.fromisoformat(m["date"])
+        except ValueError:
+            continue
+        if today - dt.timedelta(days=window) <= d <= today:
+            notes.append((d, p))
+    return sorted(notes)
+
+
+def title_index(doc: Doc) -> Dict[str, List[LocalTask]]:
+    idx: Dict[str, List[LocalTask]] = {}
+    for lt in doc.tasks:
+        idx.setdefault(norm(lt.task.content).lower(), []).append(lt)
+    return idx
+
+
+def apply_daily_ticks(md_path: Path, daily_dir: Path, state_dir: Path, dry_run: bool,
+                      today: Optional[dt.date] = None) -> None:
+    """Daily notes -> TASKS.md: a task newly ticked under '## Open tasks' is marked done in TASKS.md.
+
+    Only a change since the last seen value of that line counts, so an old tick never re-closes a task
+    that was reopened later, and an unticked line never reopens anything.
+    """
+    today = today or dt.date.today()
+    state_path = state_dir / "state.json"
+    state = load_state(state_path)
+    seen: Dict[str, Dict[str, bool]] = state.get("daily", {})
+    base = {k: Task.from_dict(v) for k, v in state.get("tasks", {}).items()}
+    text0 = md_path.read_text(encoding="utf-8")
+    doc = parse_doc(text0, base)
+    idx = title_index(doc)
+
+    decisions: Dict[int, Optional[Decision]] = {}
+    new_seen: Dict[str, Dict[str, bool]] = {}
+    for _, p in daily_notes(daily_dir, today):
+        prev = seen.get(p.name, {})
+        cur = new_seen.setdefault(p.name, {})
+        for _, checked, title in daily_task_lines(p.read_text(encoding="utf-8")):
+            cur[title] = checked
+            if not checked or prev.get(title) is True:
+                continue
+            matches = idx.get(title, [])
+            open_ = [lt for lt in matches if not lt.task.done]
+            if not open_:
+                if not matches:
+                    log(f"daily note '{p.name}': ticked task not in TASKS.md, ignored: '{title}'")
+                continue
+            if len(matches) > 1:
+                log(f"daily note '{p.name}': title matches {len(matches)} tasks, ignored: '{title}'")
+                continue
+            lt = open_[0]
+            if lt.line_no in decisions:
+                continue
+            decisions[lt.line_no] = Decision(lt.id, Task(lt.task.content, lt.task.description, lt.task.section, True),
+                                             lt.body)
+            log(f"{'[dry-run] would mark' if dry_run else 'marked'} done from daily note '{p.name}': "
+                f"'{lt.task.content}'")
+    if dry_run:
+        return
+    if decisions:
+        new_text = render_doc(doc, decisions, [])
+        if md_path.read_text(encoding="utf-8") != text0:
+            log("TASKS.md changed while applying daily-note ticks; will retry next run")
+            return
+        atomic_write(state_dir / "TASKS.md.bak", text0)
+        atomic_write(md_path, new_text)
+    state = load_state(state_path)  # re-read, keep everything else intact
+    state["daily"] = new_seen
+    save_state(state_path, state)
+
+
+def reflect_to_daily(md_path: Path, daily_dir: Path, state_dir: Path, dry_run: bool,
+                     today: Optional[dt.date] = None) -> None:
+    """TASKS.md -> today's daily note(s): toggle checkboxes of existing lines under '## Open tasks'.
+
+    Ticks a line when its task is done. Unticks only a tick that was already applied to TASKS.md
+    (i.e. the task was reopened afterwards), so an unprocessed tick by the user is never lost.
+    """
+    today = today or dt.date.today()
+    state_path = state_dir / "state.json"
+    state = load_state(state_path)
+    seen: Dict[str, Dict[str, bool]] = state.get("daily", {})
+    doc = parse_doc(md_path.read_text(encoding="utf-8"), {})
+    idx = title_index(doc)
+    applied: Dict[str, Dict[str, bool]] = {}
+    for _, p in daily_notes(daily_dir, today, window=0):
+        text0 = p.read_text(encoding="utf-8")
+        lines = text0.split("\n")
+        note_seen = seen.get(p.name, {})
+        updates: Dict[str, bool] = {}
+        for i, checked, title in daily_task_lines(text0):
+            matches = idx.get(title, [])
+            if len(matches) != 1:
+                continue
+            done = matches[0].task.done
+            if done and not checked:
+                lines[i] = lines[i].replace("- [ ]", "- [x]", 1)
+            elif not done and checked and note_seen.get(title) is True:
+                lines[i] = re.sub(r"^- \[[xX]\]", "- [ ]", lines[i], count=1)
+            else:
+                continue
+            updates[title] = done
+            log(f"{'[dry-run] would ' if dry_run else ''}{'tick' if done else 'untick'} in '{p.name}': "
+                f"'{matches[0].task.content}'")
+        if not updates or dry_run:
+            continue
+        if p.read_text(encoding="utf-8") != text0:
+            log(f"'{p.name}' changed during sync; checkbox update postponed to next run")
+            continue
+        atomic_write(p, "\n".join(lines))
+        applied[p.name] = updates
+    if applied:
+        state = load_state(state_path)  # re-read, keep everything else intact
+        daily = state.setdefault("daily", {})
+        for name, updates in applied.items():
+            daily.setdefault(name, {}).update(updates)
+        save_state(state_path, state)
+
+
 def sync(md_path: Path, project_name: str, state_dir: Path, dry_run: bool) -> int:
     state_path = state_dir / "state.json"
     state = load_state(state_path)
@@ -754,11 +909,17 @@ def main() -> int:
     ap.add_argument("--scan-dir", type=Path, default=None,
                     help="folder scanned for new .md files with open tasks (default: <vault>/Meeting Summaries)")
     ap.add_argument("--no-import", action="store_true", help="skip importing tasks from new files")
+    ap.add_argument("--daily-dir", type=Path, default=None,
+                    help="folder with YYYY-MM-DD.md daily notes (default: the vault root, two levels above --file)")
+    ap.add_argument("--no-daily", action="store_true", help="skip syncing checkboxes with daily notes")
     ap.add_argument("--dry-run", action="store_true", help="show planned changes, write nothing")
     a = ap.parse_args()
     if a.scan_dir is None:
         env = os.environ.get("TODOIST_SYNC_SCAN_DIR")
         a.scan_dir = Path(env) if env else a.file.parent.parent / "Meeting Summaries"
+    if a.daily_dir is None:
+        env = os.environ.get("TODOIST_SYNC_DAILY_DIR")
+        a.daily_dir = Path(env) if env else a.file.parent.parent
 
     a.state_dir.mkdir(parents=True, exist_ok=True)
     with open(a.state_dir / "lock", "w") as lock:
@@ -770,7 +931,12 @@ def main() -> int:
         try:
             if not a.no_import:
                 import_new_tasks(a.file, a.scan_dir, a.state_dir, a.dry_run)
-            return sync(a.file, a.project, a.state_dir, a.dry_run)
+            if not a.no_daily:
+                apply_daily_ticks(a.file, a.daily_dir, a.state_dir, a.dry_run)
+            rc = sync(a.file, a.project, a.state_dir, a.dry_run)
+            if rc == 0 and not a.no_daily:
+                reflect_to_daily(a.file, a.daily_dir, a.state_dir, a.dry_run)
+            return rc
         except Exception as e:  # keep launchd log readable
             log(f"ERROR {type(e).__name__}: {e}")
             return 2
